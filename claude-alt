@@ -1,0 +1,564 @@
+#!/bin/bash
+# claude-alt — manage extra Claude Desktop apps, each with its own account,
+# its own Dock icon/name, and its own recolored icon.
+#
+# Each clone is an APFS copy-on-write clone of /Applications/Claude.app
+# (instant, ~0 extra disk) with:
+#   - CFBundleDisplayName  -> "Claude <Name>"   (Dock + Cmd-Tab label)
+#   - CFBundleIdentifier   -> local.claude<name> (separate app identity)
+#   - LSEnvironment.CLAUDE_USER_DATA_DIR -> its own profile dir
+#   - electron.icns        -> the Claude icon recolored to your hex
+#   - ad-hoc code signature (the original signature cannot survive edits)
+#
+# Clones do NOT auto-update. After Claude updates, run:  claude-alt refresh
+
+set -euo pipefail
+
+SRC="/Applications/Claude.app"
+DEST="$HOME/Applications"
+SUPPORT="$HOME/Library/Application Support"
+LSREG=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
+PY="$(command -v python3 || true)"
+BASE_HEX="d97757"   # the stock Claude clay orange
+SIGN_CN="Claude Alt Local Signing"
+
+# Ad-hoc signing pins the designated requirement to a cdhash, which changes on
+# every rebuild and so invalidates the keychain ACL on "Claude Safe Storage" —
+# that is what forces a fresh login after each refresh. Signing with a stable
+# self-signed identity gives a DR of `identifier X and certificate root = H"..."`,
+# which survives rebuilds. Falls back to ad-hoc if the identity is absent.
+signing_id() {
+  if security find-identity -p codesigning 2>/dev/null | grep -qF "\"$SIGN_CN\""; then
+    printf '%s' "$SIGN_CN"
+  else
+    printf '%s' "-"
+  fi
+}
+
+die() { echo "claude-alt: $*" >&2; exit 1; }
+
+usage() {
+cat <<USAGE
+usage:
+  claude-alt list                      show original + all clones and versions
+  claude-alt new <name> <hex>          create "Claude <Name>.app" with that icon color
+  claude-alt refresh [name]            re-clone after a Claude update (all, or one)
+  claude-alt self-update [name] [--force]
+                                       update THIS clone from inside its own chat:
+                                       quits, rebuilds, and reopens it in the
+                                       background (name inferred when run inside)
+  claude-alt doctor [name]             verify a clone: version, identity, signature,
+                                       and (if running) that it is NOT using the
+                                       default profile
+  claude-alt run <name>                launch a clone
+  claude-alt remove <name>             delete the clone app (keeps its account data)
+  claude-alt accounts                  list account UUIDs + emails found in the
+                                       ORIGINAL profile, with session counts
+  claude-alt import-sessions <name> --email <addr> [--dry-run]
+                                       copy ONLY that account's Claude Code +
+                                       cowork sessions into a clone
+                                       (additive; originals untouched)
+
+examples:
+  claude-alt new personal 00362e
+  claude-alt refresh
+USAGE
+}
+
+pretty()  { printf '%s' "$(echo "${1:0:1}" | tr '[:lower:]' '[:upper:]')${1:1}"; }
+lname()   { printf '%s' "$(echo "$1" | tr '[:upper:]' '[:lower:]')"; }
+app_of()  { printf '%s' "$DEST/Claude $(pretty "$1").app"; }
+prof_of() { printf '%s' "$SUPPORT/Claude-$(lname "$1")"; }
+# pgrep -f cannot read argv of hardened/Developer-ID-signed processes, so match
+# on the executable path as reported by ps instead.
+running_pid() { ps -eo pid=,command= | grep -F "$1" | grep -v grep | awk '{print $1}' | head -1; }
+is_running()  { [ -n "$(running_pid "$1")" ]; }
+
+ver_of()  { /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$1/Contents/Info.plist" 2>/dev/null || echo "?"; }
+
+ents() {
+cat <<'ENT'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.automation.apple-events</key><true/>
+  <key>com.apple.security.cs.allow-jit</key><true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+  <key>com.apple.security.cs.disable-library-validation</key><true/>
+  <key>com.apple.security.device.audio-input</key><true/>
+  <key>com.apple.security.device.bluetooth</key><true/>
+  <key>com.apple.security.device.camera</key><true/>
+  <key>com.apple.security.device.print</key><true/>
+  <key>com.apple.security.device.usb</key><true/>
+  <key>com.apple.security.personal-information.location</key><true/>
+  <key>com.apple.security.personal-information.photos-library</key><true/>
+</dict>
+</plist>
+ENT
+}
+
+# recolor <icns-in-place> <hex>  — hue/sat/val remap of the orange field only
+recolor_icns() {
+  local icns="$1" hex="$2" work
+  [ -n "$PY" ] || die "python3 not found (needed to recolor the icon)"
+  work="$(mktemp -d)"
+  cp "$icns" "$work/in.icns"
+  iconutil -c iconset "$work/in.icns" -o "$work/set.iconset" || die "iconutil failed on $icns"
+  BASE_HEX="$BASE_HEX" TARGET_HEX="$hex" ICONSET="$work/set.iconset" "$PY" - <<'PYEOF'
+from PIL import Image
+import colorsys, glob, os
+base = os.environ["BASE_HEX"]; targ = os.environ["TARGET_HEX"]
+h2 = lambda s: tuple(int(s[i:i+2], 16) for i in (0, 2, 4))
+bh, bs, bv = colorsys.rgb_to_hsv(*[c/255 for c in h2(base)])
+th, ts, tv = colorsys.rgb_to_hsv(*[c/255 for c in h2(targ)])
+s_gain = ts/bs if bs else 1.0
+v_gain = tv/bv if bv else 1.0
+S_LO, S_HI = 0.20, 0.40
+for path in glob.glob(os.environ["ICONSET"] + "/*.png"):
+    im = Image.open(path).convert("RGBA"); px = im.load(); w, h = im.size
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = px[x, y]
+            if a == 0:
+                continue
+            hh, ss, vv = colorsys.rgb_to_hsv(r/255, g/255, b/255)
+            # only the warm saturated field; the cream starburst is left alone
+            if not (ss > S_LO and (hh < 0.12 or hh > 0.92)):
+                continue
+            m = 1.0 if ss >= S_HI else (ss - S_LO)/(S_HI - S_LO)
+            nr, ng, nb = colorsys.hsv_to_rgb((th + (hh - bh)) % 1.0,
+                                             min(1.0, ss*s_gain),
+                                             min(1.0, vv*v_gain))
+            px[x, y] = (round(r + (nr*255 - r)*m), round(g + (ng*255 - g)*m),
+                        round(b + (nb*255 - b)*m), a)
+    im.save(path)
+PYEOF
+  iconutil -c icns "$work/set.iconset" -o "$work/out.icns" || die "iconutil could not rebuild icns"
+  cp "$work/out.icns" "$icns"
+  rm -rf "$work"
+}
+
+build() {                       # build <name> <hex>
+  local name="$1" hex="$2" ln pr app prof stage entf
+  ln="$(lname "$name")"; pr="$(pretty "$name")"
+  app="$(app_of "$name")"; prof="$(prof_of "$name")"
+  stage="$DEST/.claude-alt-staging.app"
+
+  [ -d "$SRC" ] || die "$SRC not found"
+  [[ "$hex" =~ ^[0-9a-fA-F]{6}$ ]] || die "color must be 6 hex digits, got '$hex'"
+  [[ "$ln" =~ ^[a-z0-9]+$ ]] || die "name must be alphanumeric, got '$name'"
+
+  # refuse to run while that clone is open (its files would be swapped underneath)
+  if is_running "$app/Contents/MacOS/Claude"; then
+    die "\"Claude $pr\" is running — quit it first, then retry"
+  fi
+
+  mkdir -p "$DEST"
+  echo "  cloning $SRC (copy-on-write)..."
+  rm -rf "$stage"
+  cp -Rc "$SRC" "$stage" || die "clone failed (same APFS volume required)"
+
+  # these cannot survive an ad-hoc signature
+  rm -f  "$stage/Contents/embedded.provisionprofile"
+  rm -rf "$stage/Contents/_CodeSignature"
+
+  # NOTE: CFBundleName must stay "Claude" — Electron derives the helper app
+  # path from it, and renaming it causes "Unable to find helper app" at launch.
+  local P="$stage/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Claude $pr" "$P" >/dev/null 2>&1 \
+    || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Claude $pr" "$P"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier local.claude$ln" "$P"
+  /usr/libexec/PlistBuddy -c "Delete :CFBundleIconName" "$P" >/dev/null 2>&1 || true
+  /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$P" >/dev/null 2>&1 || true
+  /usr/libexec/PlistBuddy -c "Set :LSEnvironment:CLAUDE_USER_DATA_DIR $prof" "$P" >/dev/null 2>&1 \
+    || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:CLAUDE_USER_DATA_DIR string $prof" "$P"
+
+  # v1.34493.1 regression: CLAUDE_USER_DATA_DIR still moves Electron's paths via
+  # app.setPath('userData'), but Chromium's own dirs (IndexedDB, WebStorage,
+  # Partitions, GPUCache) stay in the DEFAULT profile -> split profile, so chats
+  # and routines read from the wrong place. Only --user-data-dir fixes the
+  # Chromium side, and argv can't come from Info.plist, so the real binary is
+  # renamed and a tiny launcher takes its place.
+  # It must be a compiled Mach-O: launchd refuses to spawn a shell script as
+  # CFBundleExecutable under hardened runtime (RBSRequestErrorDomain Code=5).
+  echo "  building launcher (pins --user-data-dir)..."
+  mv "$stage/Contents/MacOS/Claude" "$stage/Contents/MacOS/Claude-bin"
+  local csrc; csrc="$(mktemp -t claudealt).c"
+  cat > "$csrc" <<'CSRC'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <limits.h>
+#include <libgen.h>
+#include <sys/stat.h>
+#include <mach-o/dyld.h>
+
+int main(int argc, char **argv) {
+    char self[PATH_MAX]; uint32_t sz = sizeof(self);
+    if (_NSGetExecutablePath(self, &sz) != 0) return 1;
+    char resolved[PATH_MAX];
+    if (!realpath(self, resolved)) return 1;
+
+    char bin[PATH_MAX];
+    snprintf(bin, sizeof(bin), "%s/Claude-bin", dirname(resolved));
+
+    const char *prof = PROFILE_DIR;
+    mkdir(prof, 0700);                       /* best effort */
+    setenv("CLAUDE_USER_DATA_DIR", prof, 1);
+
+    char udd[PATH_MAX + 32];
+    snprintf(udd, sizeof(udd), "--user-data-dir=%s", prof);
+
+    char **nargv = calloc(argc + 3, sizeof(char *));
+    if (!nargv) return 1;
+    int n = 0;
+    nargv[n++] = bin;
+    nargv[n++] = udd;
+    for (int i = 1; i < argc; i++) nargv[n++] = argv[i];
+    nargv[n] = NULL;
+
+    execv(bin, nargv);
+    perror("claude-alt launcher: execv");
+    return 1;
+}
+CSRC
+  cc -O2 -arch arm64 -arch x86_64 -DPROFILE_DIR="\"$prof\"" \
+     -o "$stage/Contents/MacOS/Claude" "$csrc" 2>/dev/null \
+    || cc -O2 -DPROFILE_DIR="\"$prof\"" -o "$stage/Contents/MacOS/Claude" "$csrc" \
+    || die "failed to compile the launcher"
+  rm -f "$csrc"
+  chmod +x "$stage/Contents/MacOS/Claude"
+
+  echo "  recoloring icon #$BASE_HEX -> #$hex ..."
+  recolor_icns "$stage/Contents/Resources/electron.icns" "$hex"
+
+  # manifest so `refresh` can rebuild without re-asking
+  printf '{"name":"%s","hex":"%s","profile":"%s"}\n' "$ln" "$hex" "$prof" \
+    > "$stage/Contents/Resources/.claude-alt.json"
+
+  local sid; sid="$(signing_id)"
+  if [ "$sid" = "-" ]; then
+    echo "  ad-hoc signing (no stable identity found — login will reset on refresh)..."
+  else
+    echo "  signing with stable identity '$sid'..."
+  fi
+  entf="$(mktemp)"; ents > "$entf"
+  { find "$stage/Contents/Frameworks" -maxdepth 1 \( -name "*.app" -o -name "*.framework" \) 2>/dev/null || true; } \
+    | while read -r f; do
+        codesign --force --sign "$sid" --options runtime --entitlements "$entf" --timestamp=none "$f" >/dev/null 2>&1
+      done
+  codesign --force --deep --sign "$sid" --options runtime --entitlements "$entf" --timestamp=none "$stage" >/dev/null 2>&1 \
+    || die "codesign failed"
+  rm -f "$entf"
+  codesign --verify --strict "$stage" || die "signature did not verify"
+
+  "$LSREG" -u "$app" >/dev/null 2>&1 || true
+  rm -rf "$app"
+  mv "$stage" "$app"
+  "$LSREG" -f "$app" >/dev/null 2>&1 || true
+  mkdir -p "$prof"
+
+  echo "  done: $app  (v$(ver_of "$app"))"
+  echo "        profile: $prof"
+}
+
+cmd_list() {
+  printf '%-22s %-10s %-9s %s\n' NAME VERSION STATE PROFILE
+  printf '%-22s %-10s %-9s %s\n' "Claude (original)" "$(ver_of "$SRC")" \
+    "$(is_running "$SRC/Contents/MacOS/Claude" && echo running || echo -)" \
+    "$SUPPORT/Claude"
+  local found=0 src_v; src_v="$(ver_of "$SRC")"
+  for app in "$DEST"/Claude\ *.app; do
+    [ -d "$app" ] || continue
+    [ -f "$app/Contents/Resources/.claude-alt.json" ] || continue
+    found=1
+    local v state prof n
+    n="$(sed -n 's/.*"name":"\([^"]*\)".*/\1/p' "$app/Contents/Resources/.claude-alt.json")"
+    v="$(ver_of "$app")"
+    state="$(is_running "$app/Contents/MacOS/Claude" && echo running || echo -)"
+    prof="$(sed -n 's/.*"profile":"\([^"]*\)".*/\1/p' "$app/Contents/Resources/.claude-alt.json")"
+    # a self-update cannot install (ad-hoc cdhash pin), but detect any drift anyway
+    local warn="" dn exp adhoc
+    dn="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$app/Contents/Info.plist" 2>/dev/null || echo '')"
+    exp="Claude $(pretty "$n")"
+    # accept either the stable identity or a fallback ad-hoc signature;
+    # only an unexpected authority means the bundle was replaced
+    adhoc="$(codesign -dv --verbose=2 "$app" 2>&1 \
+             | grep -cE "Signature=adhoc|^Authority=$SIGN_CN" || true)"
+    [ "$v" != "$src_v" ]   && warn="   << STALE (original is v$src_v), run: claude-alt refresh"
+    [ "$dn" != "$exp" ]    && warn="   << CLOBBERED (name is '$dn'), run: claude-alt refresh"
+    [ "${adhoc:-0}" -lt 1 ] && warn="   << CLOBBERED (signature replaced), run: claude-alt refresh"
+    printf '%-22s %-10s %-9s %s%s\n' "$(basename "$app" .app)" "$v" "$state" "$prof" "$warn"
+  done
+  [ "$found" = 1 ] || echo "(no clones yet — try: claude-alt new personal 00362e)"
+}
+
+# resolve account UUIDs for an email by reading emailAddress out of
+# local-agent-mode-sessions metadata (claude-code-sessions has no such field,
+# but both are keyed by the same account UUID directory)
+account_uuids_for() {   # $1 = email
+  EMAIL="$1" SUPPORT="$SUPPORT" "$PY" - <<'PYEOF'
+import json, glob, os, collections
+D = os.environ["SUPPORT"] + "/Claude"
+want = os.environ["EMAIL"].strip().lower()
+hit = set()
+for top in sorted(os.listdir(D + "/local-agent-mode-sessions")):
+    base = os.path.join(D, "local-agent-mode-sessions", top)
+    if not os.path.isdir(base):
+        continue
+    for f in glob.glob(base + "/**/local_*.json", recursive=True):
+        try:
+            e = json.load(open(f)).get("emailAddress")
+        except Exception:
+            continue
+        if e and e.strip().lower() == want:
+            hit.add(top); break
+for t in sorted(hit):
+    print(t)
+PYEOF
+}
+
+cmd_accounts() {
+  SUPPORT="$SUPPORT" "$PY" - <<'PYEOF'
+import json, glob, os, collections
+D = os.environ["SUPPORT"] + "/Claude"
+rows = []
+for top in sorted(os.listdir(D + "/local-agent-mode-sessions")):
+    base = os.path.join(D, "local-agent-mode-sessions", top)
+    if not os.path.isdir(base):
+        continue
+    em = collections.Counter()
+    for f in glob.glob(base + "/**/local_*.json", recursive=True):
+        try:
+            e = json.load(open(f)).get("emailAddress")
+        except Exception:
+            continue
+        if e:
+            em[e] += 1
+    cc = len(glob.glob(os.path.join(D, "claude-code-sessions", top) + "/**/local_*.json", recursive=True))
+    la = sum(em.values())
+    who = ", ".join(f"{e}" for e, _ in em.most_common()) or "(no email metadata)"
+    rows.append((top, who, cc, la))
+print(f"{'ACCOUNT UUID':38s} {'EMAIL':32s} {'CODE':>5s} {'AGENT':>6s}")
+for top, who, cc, la in rows:
+    print(f"{top:38s} {who:32s} {cc:5d} {la:6d}")
+PYEOF
+}
+
+cmd_import() {                  # cmd_import <name> --email <addr> [--dry-run]
+  local name="$1"; shift
+  local email="" dry=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --email) email="${2:-}"; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      *) die "unknown option '$1'" ;;
+    esac
+  done
+  [ -n "$email" ] || die "--email is required (see: claude-alt accounts)"
+
+  local prof app src uuids total=0
+  app="$(app_of "$name")"; prof="$(prof_of "$name")"; src="$SUPPORT/Claude"
+  [ -d "$prof" ] || die "no profile for '$name' at $prof"
+  [ -d "$src" ]  || die "original profile not found at $src"
+  is_running "$app/Contents/MacOS/Claude" && die "quit \"Claude $(pretty "$name")\" first"
+
+  uuids="$(account_uuids_for "$email")"
+  [ -n "$uuids" ] || die "no account matched '$email' (see: claude-alt accounts)"
+  echo "  '$email' -> account(s):"
+  echo "$uuids" | sed 's/^/      /'
+
+  while read -r u; do
+    [ -n "$u" ] || continue
+    for sub in claude-code-sessions local-agent-mode-sessions; do
+      [ -d "$src/$sub/$u" ] || continue
+      local n
+      n=$({ find "$src/$sub/$u" -name 'local_*.json' 2>/dev/null || true; } | wc -l | tr -d ' ')
+      total=$((total + n))
+      if [ -n "$dry" ]; then
+        echo "      would copy $sub/$u  ($n sessions)"
+      else
+        mkdir -p "$prof/$sub/$u"
+        cp -Rc "$src/$sub/$u/." "$prof/$sub/$u/" 2>/dev/null || cp -R "$src/$sub/$u/." "$prof/$sub/$u/"
+        echo "      copied $sub/$u  ($n sessions)"
+      fi
+    done
+  done <<< "$uuids"
+
+  if [ -n "$dry" ]; then
+    echo "  dry run: $total sessions would be copied. Nothing written."
+  else
+    echo "  done: $total sessions copied. Original profile untouched."
+  fi
+}
+
+# Update a clone from inside that clone's own chat. The app must quit before it
+# can be rebuilt, so the work is handed to a daemonised worker (double-fork +
+# setsid) that survives the app's exit, then reopens it.
+cmd_self_update() {
+  local name="" force=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  # infer which clone we are running inside
+  if [ -z "$name" ] && [ -n "${CLAUDE_USER_DATA_DIR:-}" ]; then
+    local b; b="$(basename "$CLAUDE_USER_DATA_DIR")"
+    case "$b" in Claude-*) name="${b#Claude-}" ;; esac
+  fi
+  [ -n "$name" ] || die "not running inside a clone; pass a name: claude-alt self-update <name>"
+
+  local app mf sv cv
+  app="$(app_of "$name")"
+  mf="$app/Contents/Resources/.claude-alt.json"
+  [ -f "$mf" ] || die "no clone named '$name'"
+  sv="$(ver_of "$SRC")"; cv="$(ver_of "$app")"
+
+  if [ "$sv" = "$cv" ] && [ -z "$force" ]; then
+    echo "Claude $(pretty "$name") is already on v$cv (same as the official app)."
+    echo "Nothing to do. Use --force to rebuild anyway."
+    return 0
+  fi
+
+  local log="$HOME/Library/Logs/claude-alt-update.log"
+  local worker; worker="$(mktemp -t claudealtupd)"
+  cat > "$worker" <<WORKER
+#!/bin/bash
+exec >>"$log" 2>&1
+echo "=== \$(date '+%Y-%m-%d %H:%M:%S')  self-update '$name'  $cv -> $sv ==="
+osascript -e 'tell application id "local.claude$(lname "$name")" to quit' >/dev/null 2>&1
+for i in \$(seq 1 60); do
+  ps -eo command= | grep -F "$app/Contents/MacOS/Claude-bin" | grep -qv grep || break
+  sleep 1
+done
+if ps -eo command= | grep -F "$app/Contents/MacOS/Claude-bin" | grep -qv grep; then
+  echo "  app did not quit within 60s; forcing"
+  pkill -f "$app/Contents/MacOS/Claude-bin"
+  sleep 3
+fi
+if "$0" refresh "$name"; then
+  open "$app" && echo "  relaunched OK"
+else
+  echo "  REFRESH FAILED — reopening the old build so you are not left without an app"
+  open "$app"
+fi
+rm -f "$worker"
+WORKER
+  chmod +x "$worker"
+
+  "$PY" - "$worker" <<'DAEMON'
+import os, sys
+worker = sys.argv[1]
+if os.fork() > 0:
+    sys.exit(0)          # parent returns immediately
+os.setsid()              # detach from the app's session
+if os.fork() > 0:
+    os._exit(0)
+os.execv("/bin/bash", ["/bin/bash", worker])
+DAEMON
+
+  echo "Updating Claude $(pretty "$name"): v$cv -> v$sv."
+  echo "This app will quit, rebuild, and reopen on its own (~30s)."
+  echo "Progress log: $log"
+}
+
+cmd_doctor() {                  # cmd_doctor [name]
+  local target="${1:-}" any=0 fails=0
+  for app in "$DEST"/Claude\ *.app; do
+    [ -d "$app" ] || continue
+    local mf="$app/Contents/Resources/.claude-alt.json"
+    [ -f "$mf" ] || continue
+    local n prof
+    n="$(sed -n 's/.*"name":"\([^"]*\)".*/\1/p' "$mf")"
+    prof="$(sed -n 's/.*"profile":"\([^"]*\)".*/\1/p' "$mf")"
+    [ -n "$target" ] && [ "$(lname "$target")" != "$n" ] && continue
+    any=1
+    echo "Claude $(pretty "$n"):"
+
+    # --- static checks
+    local v sv dn sig lt
+    v="$(ver_of "$app")"; sv="$(ver_of "$SRC")"
+    [ "$v" = "$sv" ] && echo "  [ok]   version $v matches original" \
+                     || { echo "  [FAIL] version $v != original $sv -> claude-alt refresh"; fails=$((fails+1)); }
+    dn="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$app/Contents/Info.plist" 2>/dev/null)"
+    [ "$dn" = "Claude $(pretty "$n")" ] && echo "  [ok]   display name '$dn'" \
+                     || { echo "  [FAIL] display name is '$dn'"; fails=$((fails+1)); }
+    local auth
+    auth="$(codesign -dv --verbose=2 "$app" 2>&1 | sed -n 's/^Authority=//p' | head -1)"
+    if [ "$auth" = "$SIGN_CN" ]; then
+      echo "  [ok]   signed by stable identity (login survives refresh)"
+    elif codesign -dv --verbose=2 "$app" 2>&1 | grep -q 'Signature=adhoc'; then
+      echo "  [warn] ad-hoc signature — each refresh will force a re-login"
+    else
+      echo "  [FAIL] unexpected signature authority '$auth'"; fails=$((fails+1))
+    fi
+    lt="$(file -b "$app/Contents/MacOS/Claude" 2>/dev/null | head -1)"
+    case "$lt" in *Mach-O*) echo "  [ok]   launcher is Mach-O" ;;
+      *) echo "  [FAIL] launcher is not a Mach-O ('$lt') — launchd will refuse to spawn it"; fails=$((fails+1)) ;;
+    esac
+
+    # --- runtime checks (the ones that actually catch a split profile)
+    local pid
+    pid="$(running_pid "$app/Contents/MacOS/Claude-bin")"
+    if [ -z "$pid" ]; then
+      echo "  [--]   not running; start it and re-run for the routing checks"
+    else
+      local leak pinned
+      leak=$(lsof -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | grep -c "Application Support/Claude/" || true)
+      [ "$leak" = "0" ] && echo "  [ok]   0 files open in the DEFAULT profile" \
+                        || { echo "  [FAIL] $leak files open in the DEFAULT profile — split profile!"; fails=$((fails+1)); }
+      pinned=$(pgrep -P "$pid" 2>/dev/null | while read -r c; do
+                 ps -p "$c" -o command= | grep -oE '\-\-user-data-dir=/Users/[^ ]*( [^-][^ ]*)*'
+               done | sort -u | grep -c "$prof" || true)
+      [ "${pinned:-0}" -ge 1 ] && echo "  [ok]   helpers pinned to $(basename "$prof")" \
+                        || { echo "  [FAIL] helpers not pinned to $(basename "$prof")"; fails=$((fails+1)); }
+    fi
+  done
+  [ "$any" = 1 ] || die "no clones found${target:+ for '$target'}"
+  echo
+  [ "$fails" = 0 ] && echo "All checks passed." || { echo "$fails check(s) FAILED."; return 1; }
+}
+
+cmd_refresh() {
+  local target="${1:-}" any=0
+  for app in "$DEST"/Claude\ *.app; do
+    [ -d "$app" ] || continue
+    local mf="$app/Contents/Resources/.claude-alt.json"
+    [ -f "$mf" ] || continue
+    local n h
+    n="$(sed -n 's/.*"name":"\([^"]*\)".*/\1/p' "$mf")"
+    h="$(sed -n 's/.*"hex":"\([^"]*\)".*/\1/p' "$mf")"
+    if [ -n "$target" ] && [ "$(lname "$target")" != "$n" ]; then continue; fi
+    any=1
+    echo "refreshing Claude $(pretty "$n") -> v$(ver_of "$SRC")"
+    build "$n" "$h"
+  done
+  [ "$any" = 1 ] || die "nothing to refresh${target:+ for '$target'}"
+}
+
+[ $# -ge 1 ] || { usage; exit 64; }
+case "$1" in
+  list)    cmd_list ;;
+  new)     [ $# -eq 3 ] || die "usage: claude-alt new <name> <hex>"; build "$2" "$3" ;;
+  refresh) cmd_refresh "${2:-}"
+           echo; echo "Now start each clone and run: claude-alt doctor" ;;
+  doctor)  cmd_doctor "${2:-}" ;;
+  self-update) shift; cmd_self_update "$@" ;;
+  accounts) cmd_accounts ;;
+  import-sessions) [ $# -ge 2 ] || die "usage: claude-alt import-sessions <name> --email <addr> [--dry-run]"
+           shift; cmd_import "$@" ;;
+  run)     [ $# -eq 2 ] || die "usage: claude-alt run <name>"
+           app="$(app_of "$2")"; [ -d "$app" ] || die "no such clone: $app"
+           open "$app" && echo "launched $(basename "$app" .app)" ;;
+  remove)  [ $# -eq 2 ] || die "usage: claude-alt remove <name>"
+           app="$(app_of "$2")"; [ -d "$app" ] || die "no such clone: $app"
+           is_running "$app/Contents/MacOS/Claude" && die "quit it first"
+           "$LSREG" -u "$app" >/dev/null 2>&1 || true; rm -rf "$app"
+           echo "removed $app (account data kept at $(prof_of "$2"))" ;;
+  -h|--help|help) usage ;;
+  *)       die "unknown command '$1' (try: claude-alt --help)" ;;
+esac
