@@ -59,6 +59,9 @@ usage:
                                        cowork sessions into a clone
                                        (additive; originals untouched)
 
+every build applies the ghost-window patch (see patch_ghost_windows);
+CLAUDE_ALT_NO_PATCH=1 builds a clone without it.
+
 examples:
   claude-alt new personal 00362e
   claude-alt refresh
@@ -137,6 +140,71 @@ PYEOF
   iconutil -c icns "$work/set.iconset" -o "$work/out.icns" || die "iconutil could not rebuild icns"
   cp "$work/out.icns" "$icns"
   rm -rf "$work"
+}
+
+# Every macOS fullscreen cycle of the Claude window leaves a screen-sized
+# snapshot window (untitled, opaque, no accessibility role) behind the real
+# one — Electron's fullscreen-transition window is never torn down. They pile
+# up, and with every app minimised the desktop shows the newest snapshot
+# instead of the wallpaper. Hiding and re-showing the app clears them, so the
+# patch does exactly that in the main process right after the window leaves
+# fullscreen. app.asar is repacked with that one chunk replaced (per-file
+# integrity recomputed) and Info.plist's ElectronAsarIntegrity hash updated,
+# both before signing. Skipped, with a notice, when a new Claude build no
+# longer contains the anchor; CLAUDE_ALT_NO_PATCH=1 skips it on purpose.
+patch_ghost_windows() {         # patch_ghost_windows <stage.app>
+  local stage="$1" asar="$1/Contents/Resources/app.asar" P="$1/Contents/Info.plist" tmp hash
+  [ -n "$PY" ] || { echo "  ghost-window patch: python3 not found — skipped"; return 0; }
+  tmp="$(mktemp -d -t claudealt)"
+  if hash="$("$PY" -I - "$asar" "$tmp/app.asar" <<'PYS'
+import sys, struct, json, hashlib
+src, dst = sys.argv[1], sys.argv[2]
+ANCHOR = b'p.on("leave-full-screen",e)}p.webContents.on("before-input-event"'
+HOOK = (b'p.on("leave-full-screen",e)}'
+        b'p.on("leave-full-screen",(()=>{for(let e of[600,2500])setTimeout((()=>{try{'
+        b'p.isDestroyed()||!p.isVisible()||p.isMinimized()||p.isFullScreen()||'
+        b'(a.app.hide(),a.app.show(),a.app.focus({steal:!0}),p.focus())}catch{}}),e)}));'
+        b'p.webContents.on("before-input-event"')
+BLOCK = 4 * 1024 * 1024
+with open(src, 'rb') as fh:
+    p4, hdr_pickle = struct.unpack('<II', fh.read(8))
+    payload, slen = struct.unpack('<II', fh.read(8))
+    js = fh.read(slen)
+    fh.seek(8 + hdr_pickle)
+    data = fh.read()
+hdr = json.loads(js.decode('utf-8'))
+build = hdr['files']['.vite']['files']['build']['files']
+target = None
+for name, e in build.items():
+    if name.endswith('.js') and 'files' not in e and not e.get('unpacked') and e['size'] > 1000000:
+        off = int(e['offset']); chunk = data[off:off + e['size']]
+        if chunk.count(ANCHOR) == 1:
+            target = (e, chunk); break
+if not target:
+    sys.exit(2)
+e, chunk = target
+new = chunk.replace(ANCHOR, HOOK, 1)
+e['size'] = len(new); e['offset'] = str(len(data))
+if 'integrity' in e:
+    e['integrity'] = {'algorithm': 'SHA256', 'hash': hashlib.sha256(new).hexdigest(), 'blockSize': BLOCK,
+                      'blocks': [hashlib.sha256(new[i:i + BLOCK]).hexdigest() for i in range(0, len(new), BLOCK)]}
+njs = json.dumps(hdr, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+pad = (4 - len(njs) % 4) % 4
+with open(dst, 'wb') as o:
+    o.write(struct.pack('<II', 4, 8 + len(njs) + pad))
+    o.write(struct.pack('<II', 4 + len(njs) + pad, len(njs)))
+    o.write(njs); o.write(b'\0' * pad); o.write(data); o.write(new)
+print(hashlib.sha256(njs).hexdigest())
+PYS
+  )"; then
+    mv "$tmp/app.asar" "$asar"
+    /usr/libexec/PlistBuddy -c "Set :ElectronAsarIntegrity:Resources/app.asar:hash $hash" "$P" \
+      || die "could not update ElectronAsarIntegrity in Info.plist"
+    echo "  ghost-window patch applied (asar header $hash)"
+  else
+    echo "  ghost-window patch: anchor not found in v$(ver_of "$stage") — skipped (report it)"
+  fi
+  rm -rf "$tmp"
 }
 
 build() {                       # build <name> <hex>
@@ -237,6 +305,8 @@ CSRC
   # manifest so `refresh` can rebuild without re-asking
   printf '{"name":"%s","hex":"%s","profile":"%s"}\n' "$ln" "$hex" "$prof" \
     > "$stage/Contents/Resources/.claude-alt.json"
+
+  [ "${CLAUDE_ALT_NO_PATCH:-}" = 1 ] || patch_ghost_windows "$stage"
 
   local sid; sid="$(signing_id)"
   if [ "$sid" = "-" ]; then

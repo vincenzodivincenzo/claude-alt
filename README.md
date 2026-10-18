@@ -62,6 +62,22 @@ claude-alt import-sessions <name> --email <addr>  copy one account's sessions in
 Clones do **not** auto-update. After Claude updates itself, run `claude-alt refresh`
 then `claude-alt doctor`. `list` flags `<< STALE` and `<< CLOBBERED`.
 
+## Patches applied to every clone
+
+**Ghost fullscreen windows.** Each macOS fullscreen cycle of the Claude window leaves
+a screen-sized snapshot window (untitled, opaque, no accessibility role) behind the
+real one — Electron's fullscreen-transition window is never torn down. They pile up,
+and with every app minimised the desktop shows the newest snapshot instead of the
+wallpaper. Hiding and re-showing the app clears them, so the build patches the main
+process to do exactly that right after the window leaves fullscreen (600 ms and
+2.5 s later, as a single short blink). Mechanics: `app.asar` is repacked with that
+one chunk replaced, per-file integrity recomputed, and `ElectronAsarIntegrity` in
+`Info.plist` updated, all before signing. When a new Claude build no longer contains
+the anchor the step prints `anchor not found` and the clone builds unpatched.
+`CLAUDE_ALT_NO_PATCH=1 claude-alt refresh <name>` builds without it on purpose.
+Already-running clone with ghosts on screen, no restart: hide and re-show it
+(⌘H, then click its Dock icon).
+
 ## Four traps, learned the hard way
 
 **1. `CFBundleName` must stay `"Claude"`.**
